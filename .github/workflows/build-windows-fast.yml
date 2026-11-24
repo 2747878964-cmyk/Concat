@@ -1,0 +1,142 @@
+name: Build Windows Fast
+
+on:
+  push:
+    branches:
+      - fast-win
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  ORT_VERSION: 1.28.0
+  GGML_NATIVE: "OFF"
+  GGML_BACKEND_DL: "ON"
+  GGML_CPU_ALL_VARIANTS: "ON"
+  GGML_AVX2: "OFF"
+  GGML_FMA: "OFF"
+  GGML_F16C: "OFF"
+  GGML_BMI2: "OFF"
+  CARGO_PROFILE_APP_LTO: thin
+  CARGO_PROFILE_APP_CODEGEN_UNITS: "16"
+
+jobs:
+  windows-x86_64:
+    name: windows-x86_64-fast
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: The pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' src/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: FFmpeg development libraries and LLVM (Windows)
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          & $bash scripts/ci/fetch.sh "llvm-win64" llvm.exe
+          if ($LASTEXITCODE -ne 0) { throw "the LLVM download failed" }
+          Start-Process -Wait -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\llvm"
+          if (-not (Test-Path C:\llvm\bin\libclang.dll)) { throw "LLVM did not install to C:\llvm" }
+          Remove-Item llvm.exe -ErrorAction SilentlyContinue
+          "C:\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=C:\llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $bash scripts/ci/fetch.sh "ffmpeg-win64" ffmpeg-win.zip
+          if ($LASTEXITCODE -ne 0) { throw "the FFmpeg download failed" }
+          Expand-Archive ffmpeg-win.zip -DestinationPath ffdl
+          $dir = (Get-ChildItem ffdl -Directory | Select-Object -First 1).FullName
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: ONNX Runtime (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh "onnxruntime-win-x64" onnxruntime.zip
+          if ($LASTEXITCODE -ne 0) { throw "the ONNX Runtime download failed" }
+          Expand-Archive onnxruntime.zip -DestinationPath .
+          $dir = "$PWD\onnxruntime-win-x64-$env:ORT_VERSION"
+          if (-not (Test-Path "$dir\lib\onnxruntime.lib")) { throw "$dir\lib\onnxruntime.lib is not there" }
+          if (-not (Test-Path "$dir\lib\onnxruntime.dll")) { throw "$dir\lib\onnxruntime.dll is not there" }
+          "ORT_LIB_LOCATION=$dir\lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\lib" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: sherpa-onnx shared libraries (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Select-String -Path src\Cargo.lock -Pattern 'name = "sherpa-onnx-sys"' -Context 0,1).Context.PostContext[0] -replace '.*"(.*)".*', '$1'
+          $name = "sherpa-onnx-win-x64-shared-MT-Release-lib"
+          $stem = "sherpa-onnx-v$version-win-x64-shared-MT-Release-lib"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          & $bash scripts/ci/fetch.sh $name sherpa.tar.bz2
+          if ($LASTEXITCODE -ne 0) { throw "the sherpa-onnx download failed" }
+          python -c "import tarfile; t = tarfile.open('sherpa.tar.bz2'); t.extractall(**({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))"
+          if (-not (Test-Path "$stem\lib")) { throw "$stem\lib is not there after unpacking" }
+          New-Item -ItemType Directory -Force sherpa-libs, sherpa-dlls | Out-Null
+          Copy-Item "$stem\lib\sherpa-onnx-*.lib" sherpa-libs\
+          Copy-Item "$stem\lib\sherpa-onnx-*.dll" sherpa-dlls\
+          "SHERPA_ONNX_LIB_DIR=$PWD\sherpa-libs" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHERPA_DLL_DIR=$PWD\sherpa-dlls" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src
+          key: win64-fast
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST GGML ORT
+
+      - name: Build concat.exe
+        timeout-minutes: 45
+        shell: bash
+        working-directory: src
+        run: |
+          set -o pipefail
+          cargo build --profile app -p concat --target x86_64-pc-windows-msvc 2>&1 | tee build.log
+
+      - name: Build log on failure
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f src/build.log ]; then
+            {
+              echo "### Build failed"
+              echo '```'
+              tail -n 150 src/build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Smoke check concat.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "stage"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "src\target\x86_64-pc-windows-msvc\app\concat.exe" $dir
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dir
+          Copy-Item "$env:SHERPA_DLL_DIR\*.dll" $dir
+          Copy-Item "$env:ORT_DIR\lib\*.dll" $dir
+          $built = Get-ChildItem "src\target\x86_64-pc-windows-msvc\app\build\whisper-rs-sys-*\out\bin\ggml-cpu-x64.dll" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw "whisper-rs-sys installed no ggml-cpu-x64.dll" }
+          Copy-Item "$($built.DirectoryName)\whisper.dll", "$($built.DirectoryName)\ggml*.dll" $dir
+          & ".\stage\concat.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "concat.exe --version failed with $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item "src\target\x86_64-pc-windows-msvc\app\concat.exe" artifact\concat.exe
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: concat-exe-win64
+          path: artifact/concat.exe
+          if-no-files-found: error

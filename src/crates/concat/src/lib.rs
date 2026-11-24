@@ -1250,11 +1250,23 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     editor.on_clip_set(on_lanes!(|state, field: ClipField, value: f32| {
         state.clip_set(field, value);
     }));
-    editor.on_clip_set_text(on_lanes!(
-        |state, field: ClipTextField, value: SharedString| {
-            state.clip_set_text(field, value.as_str());
-        }
-    ));
+    editor.on_clip_set_text(move |field: ClipTextField, value: SharedString| {
+        Shell::with(|shell, app| {
+            if field == ClipTextField::Content {
+                shell
+                    .studio
+                    .borrow_mut()
+                    .clip_set_text_debounced(value.as_str());
+            } else {
+                {
+                    let mut state = shell.studio.borrow_mut();
+                    state.clip_set_text(field, value.as_str());
+                }
+                shell.studio.borrow_mut().refresh_art();
+                shell.studio.borrow().publish_lanes(&app, &shell.models);
+            }
+        });
+    });
     editor.on_clip_set_colour(on_lanes!(
         |state, field: ClipTextField, value: slint::Color| {
             state.clip_set_colour(field, value);

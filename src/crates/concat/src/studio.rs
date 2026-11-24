@@ -950,6 +950,7 @@ pub struct Studio {
     /// the inspector edits every selected title at once.
     commit_targets: Vec<String>,
     commit_timer: slint::Timer,
+    text_timer: slint::Timer,
     /// What the catalogue shelves were last built from; while nothing in
     /// it changes the shelves are not rebuilt.
     shelf_stamp: std::cell::RefCell<Option<ShelfStamp>>,
@@ -2313,6 +2314,7 @@ impl Studio {
             commit_pending: false,
             commit_targets: Vec::new(),
             commit_timer: slint::Timer::default(),
+            text_timer: slint::Timer::default(),
             shelf_stamp: std::cell::RefCell::new(None),
             look_art: std::cell::RefCell::new(HashMap::new()),
             card_paths: HashMap::new(),
@@ -2925,10 +2927,11 @@ impl Studio {
                 let scale = f64::from(shown_w) / f64::from(width);
                 let up = |px: u32| (f64::from(px) / scale).round() as u32;
                 let up_off = |px: i32| (f64::from(px) / scale).round() as i32;
+                let live_at = (!self.playing).then(|| f64::from(self.preview_time()));
                 for title in self
                     .host
                     .titles
-                    .clips_live(self.project(), shown_w, shown_h)
+                    .clips_live_at(self.project(), shown_w, shown_h, live_at)
                 {
                     self.title_blocks.insert(
                         title.clip_id,
@@ -5314,6 +5317,49 @@ impl Studio {
         self.request_preview();
     }
 
+    /// Updates the echo's text immediately on each keystroke (so nothing can
+    /// be lost on blur, selection change or undo) while coalescing the heavy
+    /// title rasterisation and timeline republish behind a short debounce.
+    pub fn clip_set_text_debounced(&mut self, value: &str) {
+        let ids = self.edit_targets();
+        if ids.len() != 1 {
+            return;
+        }
+        self.commit_targets = ids.clone();
+        self.begin_echo();
+        for id in ids {
+            let Some(clip) = self.echo_clip_mut(&id) else {
+                continue;
+            };
+            if clip.kind != model::ClipKind::Text {
+                continue;
+            }
+            let text = clip.text.get_or_insert_with(TextStyle::default);
+            text.content = value.to_owned();
+            let first = value.lines().next().unwrap_or("").trim().to_owned();
+            clip.name = if first.is_empty() {
+                "Title".into()
+            } else {
+                first
+            };
+        }
+        self.commit_pending = true;
+        self.text_timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(140),
+            || {
+                crate::host::Shell::with(|shell, app| {
+                    {
+                        let mut studio = shell.studio.borrow_mut();
+                        studio.request_preview();
+                        studio.refresh_art();
+                    }
+                    shell.studio.borrow().publish_lanes(&app, &shell.models);
+                });
+            },
+        );
+    }
+
     // ── fonts ──
 
     /// The families a title can be set in, in the order the picker shows
@@ -5502,6 +5548,7 @@ impl Studio {
         }
         self.commit_pending = false;
         self.commit_timer.stop();
+        self.text_timer.stop();
         self.commit_now();
     }
 

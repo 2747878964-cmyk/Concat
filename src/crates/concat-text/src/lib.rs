@@ -1267,7 +1267,7 @@ pub fn render_frame(
 ) -> Result<RenderedFrame, Error> {
     let (canvas, block, words) = paint(fonts, style, width, height)?;
     Ok(RenderedFrame {
-        rgba: straight_rgba(&canvas),
+        rgba: straight_rgba(canvas),
         width,
         height,
         block_width: block.0,
@@ -1474,27 +1474,43 @@ fn paint(
     }
 
     // The shadow: the words again, offset down and right, black, blurred on
-    // a layer of their own and laid under the real words.
+    // a cropped ROI layer of their own (avoiding a full-frame box blur) and
+    // laid under the real words.
     if style.shadow
         && let Some(words) = &words
-        && let Some(mut layer) = Pixmap::new(width, height)
     {
-        let mut shade = Paint {
-            anti_alias: true,
-            ..Paint::default()
-        };
-        shade.set_color(Color::from_rgba8(0, 0, 0, 150));
-        let offset = Transform::from_translate(em * 0.05, em * 0.07);
-        layer.fill_path(words, &shade, FillRule::Winding, offset, None);
-        blur(&mut layer, (em * 0.04).round().max(1.0) as usize);
-        canvas.draw_pixmap(
-            0,
-            0,
-            layer.as_ref(),
-            &PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
+        let dx = em * 0.05;
+        let dy = em * 0.07;
+        let r = (em * 0.04).round().max(1.0) as usize;
+        let margin = em + (2 * r + 4) as f32;
+        let outer_top = (frame_h - outer_h) / 2.0;
+        let x0 = ((outer_left + dx - margin).floor() as i32).clamp(0, width as i32) as u32;
+        let y0 = ((outer_top + dy - margin).floor() as i32).clamp(0, height as i32) as u32;
+        let x1 = ((outer_left + outer_w + dx + margin).ceil() as i32).clamp(0, width as i32) as u32;
+        let y1 = ((outer_top + outer_h + dy + margin).ceil() as i32).clamp(0, height as i32) as u32;
+        let rw = x1.saturating_sub(x0);
+        let rh = y1.saturating_sub(y0);
+        if rw > 0
+            && rh > 0
+            && let Some(mut layer) = Pixmap::new(rw, rh)
+        {
+            let mut shade = Paint {
+                anti_alias: true,
+                ..Paint::default()
+            };
+            shade.set_color(Color::from_rgba8(0, 0, 0, 150));
+            let offset = Transform::from_translate(dx - x0 as f32, dy - y0 as f32);
+            layer.fill_path(words, &shade, FillRule::Winding, offset, None);
+            blur(&mut layer, r);
+            canvas.draw_pixmap(
+                x0 as i32,
+                y0 as i32,
+                layer.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        }
     }
 
     // The outline, under the fill so only its outer half shows - which is
@@ -1697,7 +1713,7 @@ pub fn render_shape_frame(
 ) -> Result<RenderedFrame, Error> {
     let (canvas, block) = paint_shape(style, width, height)?;
     Ok(RenderedFrame {
-        rgba: straight_rgba(&canvas),
+        rgba: straight_rgba(canvas),
         width,
         height,
         block_width: block.0,
@@ -1709,16 +1725,23 @@ pub fn render_shape_frame(
 }
 
 /// tiny-skia keeps premultiplied pixels; a frame carries straight alpha.
-fn straight_rgba(canvas: &Pixmap) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(canvas.pixels().len() * 4);
-    for pixel in canvas.pixels() {
-        let straight = pixel.demultiply();
-        rgba.extend_from_slice(&[
-            straight.red(),
-            straight.green(),
-            straight.blue(),
-            straight.alpha(),
-        ]);
+fn straight_rgba(mut canvas: Pixmap) -> Vec<u8> {
+    let src = canvas.data_mut();
+    let mut rgba = vec![0u8; src.len()];
+    for (dst, px) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let a = px[3];
+        if a == 0 {
+            continue;
+        } else if a == 255 {
+            dst.copy_from_slice(px);
+        } else {
+            let a32 = u32::from(a);
+            let half = a32 / 2;
+            dst[0] = ((u32::from(px[0]) * 255 + half) / a32).min(255) as u8;
+            dst[1] = ((u32::from(px[1]) * 255 + half) / a32).min(255) as u8;
+            dst[2] = ((u32::from(px[2]) * 255 + half) / a32).min(255) as u8;
+            dst[3] = a;
+        }
     }
     rgba
 }

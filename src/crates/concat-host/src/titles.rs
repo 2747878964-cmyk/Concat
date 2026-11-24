@@ -207,7 +207,7 @@ impl Titles {
     /// each, for a `width` × `height` frame. One that fails to paint is left
     /// out and said once on stderr; the rest of the edit still renders.
     pub fn clips(&self, project: &Project, width: u32, height: u32) -> Vec<TitleClip> {
-        self.clips_with(project, width, height, false)
+        self.clips_with(project, width, height, false, None)
     }
 
     /// [`Titles::clips`] for a monitor showing a change as it is made:
@@ -217,10 +217,30 @@ impl Titles {
     /// touches the disk, which is what makes a drag smooth: a PNG per
     /// pointer step, encoded, written and decoded again, was the lag.
     pub fn clips_live(&self, project: &Project, width: u32, height: u32) -> Vec<TitleClip> {
-        self.clips_with(project, width, height, true)
+        self.clips_with(project, width, height, true, None)
     }
 
-    fn clips_with(&self, project: &Project, width: u32, height: u32, live: bool) -> Vec<TitleClip> {
+    /// Like [`Titles::clips_live`], but when `at` is `Some(time)` any title
+    /// outside `[start - 0.25, start + duration + 0.25]` that is not already
+    /// cached in memory is skipped rather than rasterised on the UI thread.
+    pub fn clips_live_at(
+        &self,
+        project: &Project,
+        width: u32,
+        height: u32,
+        at: Option<f64>,
+    ) -> Vec<TitleClip> {
+        self.clips_with(project, width, height, true, at)
+    }
+
+    fn clips_with(
+        &self,
+        project: &Project,
+        width: u32,
+        height: u32,
+        live: bool,
+        at: Option<f64>,
+    ) -> Vec<TitleClip> {
         if live {
             self.live.lock().unwrap_or_else(|e| e.into_inner()).begin();
         }
@@ -248,8 +268,14 @@ impl Titles {
             };
             let track = &timeline.tracks[index];
             let painted = if live {
-                self.painted_live(project, painting, width, height)
-                    .map(|(path, art, frame)| (path, art, Some(frame)))
+                let near_playhead = at.is_none_or(|time| {
+                    time >= clip.start - 0.25 && time <= clip.start + clip.duration + 0.25
+                });
+                match self.painted_live_opt(project, painting, width, height, !near_playhead) {
+                    Ok(Some((path, art, frame))) => Ok((path, art, Some(frame))),
+                    Ok(None) => continue,
+                    Err(e) => Err(e),
+                }
             } else {
                 self.painted(project, painting, width, height)
                     .map(|(path, art)| (path, art, None))
@@ -319,17 +345,21 @@ impl Titles {
 
     /// One style at one size, painted in memory: the name the monitor is
     /// to hold the pixels under, the block, and the pixels.
-    fn painted_live(
+    fn painted_live_opt(
         &self,
         project: &Project,
         painting: Painting<'_>,
         width: u32,
         height: u32,
-    ) -> Result<(PathBuf, Art, Arc<Frame>), String> {
+        only_cached: bool,
+    ) -> Result<Option<(PathBuf, Art, Arc<Frame>)>, String> {
         let key = key_of(project, painting, width, height);
         let path = PathBuf::from(format!("memory://titles/{key:016x}"));
         if let Some((art, frame)) = self.live.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
-            return Ok((path, art, frame));
+            return Ok(Some((path, art, frame)));
+        }
+        if only_cached {
+            return Ok(None);
         }
         let rendered = match painting {
             Painting::Title(style) => {
@@ -358,7 +388,7 @@ impl Titles {
             art.clone(),
             Arc::clone(&frame),
         );
-        Ok((path, art, frame))
+        Ok(Some((path, art, frame)))
     }
 
     /// The PNG for one style at one frame size, painted if it is not on disk
