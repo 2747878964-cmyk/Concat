@@ -129,8 +129,9 @@ jobs:
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $built) { throw "whisper-rs-sys installed no ggml-cpu-x64.dll" }
           Copy-Item "$($built.DirectoryName)\whisper.dll", "$($built.DirectoryName)\ggml*.dll" $dir
-          & ".\stage\concat.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw "concat.exe --version failed with $LASTEXITCODE" }
+          $verOut = & ".\stage\concat.exe" --version | Out-String
+          Write-Host "Version output: $verOut"
+          if (-not $verOut.Contains("concat")) { throw "concat.exe --version did not print version" }
           New-Item -ItemType Directory -Force artifact | Out-Null
           Copy-Item "src\target\x86_64-pc-windows-msvc\app\concat.exe" artifact\concat.exe
 
